@@ -1,3 +1,5 @@
+import __init__
+
 import torch, numpy as np
 from torch.nn import functional as F
 import random
@@ -16,17 +18,17 @@ from config import processed_data_path
 
 class S3DIS(Dataset):
     r"""
-    partition   =>   areas, can be "2"  "23"  "!23"==="1456"   
-    train=True  =>   training   
-    train=False =>   validating 
-    test=True   =>   testing    
-    warmup=True =>   warmup     
+    partition   =>   areas, can be "2"  "23"  "!23"==="1456"
+    train=True  =>   training
+    train=False =>   validating
+    test=True   =>   testing
+    warmup=True =>   warmup
 
-    args: 
-    k           =>   k in knn, [k1, k2, ..., kn]   
-    grid_size   =>   as in subsampling, [0.04, 0.06, ..., 0.3]   
-                        if warmup is True, should be estimated (lower) downsampling ratio except the first: [0.04, 2, ..., 2.5]  
-    max_pts     =>   optional, max points per sample when training  
+    args:
+    k           =>   k in knn, [k1, k2, ..., kn]
+    grid_size   =>   as in subsampling, [0.04, 0.06, ..., 0.3]
+                        if warmup is True, should be estimated (lower) downsampling ratio except the first: [0.04, 2, ..., 2.5]
+    max_pts     =>   optional, max points per sample when training
     """
     def __init__(self, args, partition="!5", loop=30, train=True, test=False, warmup=False):
 
@@ -118,7 +120,7 @@ class S3DIS(Dataset):
         indices = []
         gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
         gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
-        visible = gs.gs_points.visible
+        visible = gs.gs_points.visible.squeeze(1)
         # estimating a distance in Euclidean space as the scaler by random fps
         ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
         ps = ps.squeeze(0)
@@ -155,7 +157,7 @@ class S3DIS(Dataset):
         indices = []
         gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
         gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
-        visible = gs.gs_points.visible
+        visible = gs.gs_points.visible.squeeze(1)
         # estimating a distance in Euclidean space as the scaler by random fps
         ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
         ps = ps.squeeze(0)
@@ -193,7 +195,7 @@ class S3DIS(Dataset):
         # kdt = KDTree(xyz)
         # indices.append(kdt.knn(xyz, k.pop(), False)[0])
         kdt = KDTree(xyz.numpy(), visible.numpy())
-        _, idx = kdt.query(xyz.numpy(), visible.numpy(), k=k, alpha=self.alpha, scaler=scaler)
+        _, idx = kdt.query(xyz.numpy(), visible.numpy(), k=k.pop(), alpha=self.alpha, scaler=scaler)
         indices.append(torch.from_numpy(idx).long())
 
         if not last:

@@ -1,3 +1,5 @@
+import __init__
+
 import torch, numpy as np
 from torch.nn import functional as F
 import random, scipy.interpolate, scipy.ndimage
@@ -13,6 +15,7 @@ from utils.subsample import fps_sample
 sys.path.append(str(Path(__file__).absolute().parent.parent))
 from utils.cutils import grid_subsampling, grid_subsampling_test
 from config import processed_data_path, scan_train, scan_val
+
 
 # adapted from https://github.com/Gofinge/PointTransformerV2/blob/main/pcr/datasets/transform.py
 class ElasticDistortion(object):
@@ -59,20 +62,22 @@ class ElasticDistortion(object):
                 coord = self.elastic_distortion(coord, granularity, magnitude)
         return torch.from_numpy(coord)
 
+
 class ScanNetV2(Dataset):
     r"""
     partition   =>   train / val
-    train=True  =>   training   
-    train=False =>   validating 
-    test=True   =>   testing    
-    warmup=True =>   warmup     
+    train=True  =>   training
+    train=False =>   validating
+    test=True   =>   testing
+    warmup=True =>   warmup
 
-    args: 
-    k           =>   k in knn, [k1, k2, ..., kn]   
-    grid_size   =>   as in subsampling, [0.04, 0.06, ..., 0.3]   
-                        if warmup is True, should be estimated (lower) downsampling ratio except the first: [0.04, 2, ..., 2.5]  
-    max_pts     =>   optional, max points per sample when training  
+    args:
+    k           =>   k in knn, [k1, k2, ..., kn]
+    grid_size   =>   as in subsampling, [0.04, 0.06, ..., 0.3]
+                        if warmup is True, should be estimated (lower) downsampling ratio except the first: [0.04, 2, ..., 2.5]
+    max_pts     =>   optional, max points per sample when training
     """
+
     def __init__(self, args, partition="train", loop=6, train=True, test=False, warmup=False):
 
         self.paths = scan_train if partition == "train" else scan_val
@@ -85,10 +90,10 @@ class ScanNetV2(Dataset):
 
         self.k = list(args.k)
         self.grid_size = list(args.grid_size)
-        self.max_pts = 2**3**4
+        self.max_pts = 2 ** 3 ** 4
         if hasattr(args, "max_pts") and args.max_pts > 0:
             self.max_pts = args.max_pts
-        
+
         if warmup:
             maxpts = 0
             for p in self.paths:
@@ -97,7 +102,7 @@ class ScanNetV2(Dataset):
                     maxpts = s
                     maxp = p
             self.paths = [maxp]
-        
+
         self.datas = [torch.load(path) for path in self.paths]
         self.els = ElasticDistortion()
         gs_opts = GaussianOptions.default()
@@ -110,7 +115,7 @@ class ScanNetV2(Dataset):
 
     def __len__(self):
         return len(self.paths) * self.loop
-    
+
     def __getitem__(self, idx):
         if self.test:
             return self.get_test_item(idx)
@@ -144,13 +149,11 @@ class ScanNetV2(Dataset):
             condition = (xyz - pt).square().sum(dim=1).argsort()[:self.max_pts].sort()[0]  # sort to preserve locality
             xyz = xyz[condition]
             indices = indices[condition]
-        
 
         col = col[indices]
         lbl = lbl[indices]
         norm = norm[indices]
         col = col.float()
-
 
         if self.train and random.random() < 0.2:
             col.fill_(0.)
@@ -164,14 +167,14 @@ class ScanNetV2(Dataset):
             col.mul_(1 / 250.)
         if self.train and random.random() < 0.2:
             norm.fill_(0.)
-        
+
         height = xyz[:, 2:]
         feature = torch.cat([col, height, norm], dim=1)
 
         indices = []
         gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
         gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
-        visible = gs.gs_points.visible
+        visible = gs.gs_points.visible.squeeze(1)
         # estimating a distance in Euclidean space as the scaler by random fps
         ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
         ps = ps.squeeze(0)
@@ -183,7 +186,7 @@ class ScanNetV2(Dataset):
         xyz.mul_(60)
 
         return xyz, feature, indices, lbl
-    
+
     def get_test_item(self, idx):
         rotations = [0, 0.5, 1, 1.5]
         scales = [0.95, 1, 1.05]
@@ -202,7 +205,7 @@ class ScanNetV2(Dataset):
         rotmat *= scales[aug % len(scales)]
         xyz = xyz @ rotmat
         xyz -= xyz.min(dim=0)[0]
-        
+
         full_xyz = xyz
         full_lbl = lbl
 
@@ -212,7 +215,7 @@ class ScanNetV2(Dataset):
         norm = norm[indices]
 
         full_nn = KDTree(xyz).knn(full_xyz, 1)[0].squeeze(-1)
-    
+
         col.mul_(1 / 250.)
 
         xyz -= xyz.min(dim=0)[0]
@@ -221,7 +224,7 @@ class ScanNetV2(Dataset):
         indices = []
         gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
         gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
-        visible = gs.gs_points.visible
+        visible = gs.gs_points.visible.squeeze(1)
         # estimating a distance in Euclidean space as the scaler by random fps
         ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
         ps = ps.squeeze(0)
@@ -231,7 +234,7 @@ class ScanNetV2(Dataset):
         self.knn(xyz, visible, self.grid_size[::-1], self.k[::-1], indices, scaler)
 
         xyz.mul_(60)
-        
+
         return xyz, feature, indices, full_nn, full_lbl
 
     def knn(self, xyz: torch.Tensor, visible: torch.Tensor, grid_size: list, k: list, indices: list,
@@ -259,7 +262,7 @@ class ScanNetV2(Dataset):
         # kdt = KDTree(xyz)
         # indices.append(kdt.knn(xyz, k.pop(), False)[0])
         kdt = KDTree(xyz.numpy(), visible.numpy())
-        _, idx = kdt.query(xyz.numpy(), visible.numpy(), k=k, alpha=self.alpha, scaler=scaler)
+        _, idx = kdt.query(xyz.numpy(), visible.numpy(), k=k.pop(), alpha=self.alpha, scaler=scaler)
         indices.append(torch.from_numpy(idx).long())
 
         if not last:
@@ -271,12 +274,13 @@ class ScanNetV2(Dataset):
 
         return
 
+
 def fix_indices(indices, cnt1: list, cnt2: list):
     """
     fix so ok for indexing as a whole
     """
     first = len(cnt2) == 0
-    last = len(cnt1) == 1 or  (len(cnt1) == 2 and len(cnt2) != 0)
+    last = len(cnt1) == 1 or (len(cnt1) == 2 and len(cnt2) != 0)
 
     if first:
         c1 = cnt1[-1]
@@ -291,7 +295,7 @@ def fix_indices(indices, cnt1: list, cnt2: list):
 
     if not last:
         fix_indices(indices, cnt1, cnt2)
-    
+
     if not first:
         indices.pop().add_(c1)
 
@@ -307,11 +311,11 @@ def scan_collate_fn(batch):
     pts = []
 
     for ids in indices:
-        pts.extend(x.shape[0] for x in ids[:2*depth:2])
+        pts.extend(x.shape[0] for x in ids[:2 * depth:2])
         cnt2 = []
         fix_indices(ids[::-1], cnt1[::-1], cnt2)
         cnt1 = cnt2
-    
+
     xyz = torch.cat(xyz, dim=0)
     col = torch.cat(col, dim=0)
     lbl = torch.cat(lbl, dim=0)
@@ -319,6 +323,7 @@ def scan_collate_fn(batch):
     pts = torch.tensor(pts, dtype=torch.int64).view(-1, depth).transpose(0, 1).contiguous()
 
     return xyz, col, indices, pts, lbl
+
 
 def scan_test_collate_fn(batch):
     return batch[0]

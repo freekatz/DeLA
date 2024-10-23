@@ -8,7 +8,7 @@ import torch
 # should contain scans/
 raw_data_path = Path("/xxx/")
 
-processed_data_path = raw_data_path.parent / "scannetv2"
+processed_data_path = Path("dataset_link")
 # if you want to set the processed dataset path, uncomment here
 #processed_data_path = Path("")
 
