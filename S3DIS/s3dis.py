@@ -5,8 +5,13 @@ import math
 from torch.utils.data import Dataset, Sampler
 from pathlib import Path
 import sys
+from pykdtree.kdtree import KDTree
+
+from backbone import NaiveGaussian3D, GaussianOptions
+from utils.subsample import fps_sample
+
 sys.path.append(str(Path(__file__).absolute().parent.parent))
-from utils.cutils import grid_subsampling, KDTree, grid_subsampling_test
+from utils.cutils import grid_subsampling, grid_subsampling_test
 from config import processed_data_path
 
 class S3DIS(Dataset):
@@ -37,7 +42,7 @@ class S3DIS(Dataset):
         self.max_pts = 2**3**4
         if hasattr(args, "max_pts") and args.max_pts > 0:
             self.max_pts = args.max_pts
-        
+
         if warmup:
             maxpts = 0
             for p in self.paths:
@@ -46,13 +51,19 @@ class S3DIS(Dataset):
                     maxpts = s
                     maxp = p
             self.paths = [maxp]
-        
-        self.datas = [torch.load(path) for path in self.paths]
 
+        self.datas = [torch.load(path) for path in self.paths]
+        gs_opts = GaussianOptions.default()
+        gs_opts.n_cameras = 64
+        gs_opts.cam_fovy = 120
+        self.gs_opts = gs_opts
+        self.alpha = 0.1
+        if self.alpha == 0:
+            self.gs_opts.n_cameras = 1  # use min numbers
 
     def __len__(self):
         return len(self.paths) * self.loop
-    
+
     def __getitem__(self, idx):
         if self.test:
             return self.get_test_item(idx)
@@ -85,7 +96,7 @@ class S3DIS(Dataset):
             condition = (xyz - pt).square().sum(dim=1).argsort()[:self.max_pts].sort()[0]  # sort to preserve locality
             xyz = xyz[condition]
             indices = indices[condition]
-        
+
         col = col[indices]
         lbl = lbl[indices]
         col = col.float()
@@ -100,24 +111,33 @@ class S3DIS(Dataset):
                 alpha = random.random()
                 col = (1 - alpha + alpha * scale) * col - alpha * colmin * scale
             col.mul_(1 / 250.)
-        
+
         height = xyz[:, 2:]
         feature = torch.cat([col, height], dim=1)
 
         indices = []
-        self.knn(xyz, self.grid_size[::-1], self.k[::-1], indices)
+        gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
+        gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
+        visible = gs.gs_points.visible
+        # estimating a distance in Euclidean space as the scaler by random fps
+        ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
+        ps = ps.squeeze(0)
+        p0, p1 = ps[0], ps[1]
+        scaler = math.sqrt((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2 + (p0[2] - p1[2]) ** 2)
+
+        self.knn(xyz, visible, self.grid_size[::-1], self.k[::-1], indices, scaler)
 
         xyz.mul_(40)
 
         return xyz, feature, indices, lbl
-    
+
     def get_test_item(self, idx):
 
         pick = idx % self.loop * 5
 
         idx //= self.loop
         xyz, col, lbl = self.datas[idx]
-        
+
         full_xyz = xyz
         full_lbl = lbl
 
@@ -126,20 +146,30 @@ class S3DIS(Dataset):
         col = col[indices].float()
 
         full_nn = KDTree(xyz).knn(full_xyz, 1)[0].squeeze(-1)
-    
+
         col.mul_(1 / 250.)
 
         xyz -= xyz.min(dim=0)[0]
         feature = torch.cat([col, xyz[:, 2:]], dim=1)
 
         indices = []
-        self.knn(xyz, self.grid_size[::-1], self.k[::-1], indices)    
+        gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
+        gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
+        visible = gs.gs_points.visible
+        # estimating a distance in Euclidean space as the scaler by random fps
+        ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
+        ps = ps.squeeze(0)
+        p0, p1 = ps[0], ps[1]
+        scaler = math.sqrt((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2 + (p0[2] - p1[2]) ** 2)
+
+        self.knn(xyz, visible, self.grid_size[::-1], self.k[::-1], indices, scaler)
 
         xyz.mul_(40)
-        
+
         return xyz, feature, indices, full_nn, full_lbl
-    
-    def knn(self, xyz: torch.Tensor, grid_size: list, k: list, indices: list, full_xyz: torch.Tensor=None):
+
+    def knn(self, xyz: torch.Tensor, visible: torch.Tensor, grid_size: list, k: list, indices: list,
+            scaler, full_xyz: torch.Tensor=None, full_visible: torch.Tensor=None):
         """
         presubsampling and knn search \\
         return indices: knn1, sub1, knn2, sub2, knn3, back_knn1, back_knn2
@@ -150,23 +180,28 @@ class S3DIS(Dataset):
         gs = grid_size.pop()
         if first:
             full_xyz = xyz
+            full_visible = visible
         else:
             if self.warmup:
                 sub_indices = torch.randperm(xyz.shape[0])[:int(xyz.shape[0] / gs)].contiguous()
             else:
                 sub_indices = grid_subsampling(xyz, gs)
             xyz = xyz[sub_indices]
+            visible = visible[sub_indices]
             indices.append(sub_indices)
 
-        kdt = KDTree(xyz)
-        indices.append(kdt.knn(xyz, k.pop(), False)[0])
+        # kdt = KDTree(xyz)
+        # indices.append(kdt.knn(xyz, k.pop(), False)[0])
+        kdt = KDTree(xyz.numpy(), visible.numpy())
+        _, idx = kdt.query(xyz.numpy(), visible.numpy(), k=k, alpha=self.alpha, scaler=scaler)
+        indices.append(torch.from_numpy(idx).long())
 
         if not last:
-            self.knn(xyz, grid_size, k, indices, full_xyz)
+            self.knn(xyz, visible, grid_size, k, indices, scaler, full_xyz, full_visible)
 
         if not first:
-            back = kdt.knn(full_xyz, 1, False)[0].squeeze(-1)
-            indices.append(back)
+            _, back = kdt.query(full_xyz.numpy(), full_visible.numpy(), k=1, alpha=self.alpha, scaler=scaler)
+            indices.append(torch.from_numpy(back).long())
 
         return
 
@@ -190,7 +225,7 @@ def fix_indices(indices: list[torch.Tensor], cnt1: list, cnt2: list):
 
     if not last:
         fix_indices(indices, cnt1, cnt2)
-    
+
     if not first:
         indices.pop().add_(c1)
 
@@ -210,7 +245,7 @@ def s3dis_collate_fn(batch):
         cnt2 = []
         fix_indices(ids[::-1], cnt1[::-1], cnt2)
         cnt1 = cnt2
-    
+
     xyz = torch.cat(xyz, dim=0)
     col = torch.cat(col, dim=0)
     lbl = torch.cat(lbl, dim=0)

@@ -5,8 +5,13 @@ import math
 from torch.utils.data import Dataset
 from pathlib import Path
 import sys
+from pykdtree.kdtree import KDTree
+
+from backbone import NaiveGaussian3D, GaussianOptions
+from utils.subsample import fps_sample
+
 sys.path.append(str(Path(__file__).absolute().parent.parent))
-from utils.cutils import grid_subsampling, KDTree, grid_subsampling_test
+from utils.cutils import grid_subsampling, grid_subsampling_test
 from config import processed_data_path, scan_train, scan_val
 
 # adapted from https://github.com/Gofinge/PointTransformerV2/blob/main/pcr/datasets/transform.py
@@ -95,7 +100,13 @@ class ScanNetV2(Dataset):
         
         self.datas = [torch.load(path) for path in self.paths]
         self.els = ElasticDistortion()
-
+        gs_opts = GaussianOptions.default()
+        gs_opts.n_cameras = 64
+        gs_opts.cam_fovy = 120
+        self.gs_opts = gs_opts
+        self.alpha = 0.1
+        if self.alpha == 0:
+            self.gs_opts.n_cameras = 1  # use min numbers
 
     def __len__(self):
         return len(self.paths) * self.loop
@@ -158,7 +169,16 @@ class ScanNetV2(Dataset):
         feature = torch.cat([col, height, norm], dim=1)
 
         indices = []
-        self.knn(xyz, self.grid_size[::-1], self.k[::-1], indices)
+        gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
+        gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
+        visible = gs.gs_points.visible
+        # estimating a distance in Euclidean space as the scaler by random fps
+        ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
+        ps = ps.squeeze(0)
+        p0, p1 = ps[0], ps[1]
+        scaler = math.sqrt((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2 + (p0[2] - p1[2]) ** 2)
+
+        self.knn(xyz, visible, self.grid_size[::-1], self.k[::-1], indices, scaler)
 
         xyz.mul_(60)
 
@@ -199,13 +219,23 @@ class ScanNetV2(Dataset):
         feature = torch.cat([col, xyz[:, 2:], norm], dim=1)
 
         indices = []
-        self.knn(xyz, self.grid_size[::-1], self.k[::-1], indices)    
+        gs = NaiveGaussian3D(self.gs_opts, batch_size=8, device=xyz.device)
+        gs.projects(xyz, cam_seed=idx, cam_batch=gs.opt.n_cameras * 2)
+        visible = gs.gs_points.visible
+        # estimating a distance in Euclidean space as the scaler by random fps
+        ps, _ = fps_sample(xyz.unsqueeze(0), 2, random_start_point=True)
+        ps = ps.squeeze(0)
+        p0, p1 = ps[0], ps[1]
+        scaler = math.sqrt((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2 + (p0[2] - p1[2]) ** 2)
+
+        self.knn(xyz, visible, self.grid_size[::-1], self.k[::-1], indices, scaler)
 
         xyz.mul_(60)
         
         return xyz, feature, indices, full_nn, full_lbl
-    
-    def knn(self, xyz: torch.Tensor, grid_size: list, k: list, indices: list, full_xyz: torch.Tensor=None):
+
+    def knn(self, xyz: torch.Tensor, visible: torch.Tensor, grid_size: list, k: list, indices: list,
+            scaler, full_xyz: torch.Tensor = None, full_visible: torch.Tensor = None):
         """
         presubsampling and knn search \\
         return indices: knn1, sub1, knn2, sub2, knn3, back_knn1, back_knn2
@@ -216,22 +246,28 @@ class ScanNetV2(Dataset):
         gs = grid_size.pop()
         if first:
             full_xyz = xyz
+            full_visible = visible
         else:
             if self.warmup:
                 sub_indices = torch.randperm(xyz.shape[0])[:int(xyz.shape[0] / gs)].contiguous()
             else:
                 sub_indices = grid_subsampling(xyz, gs)
             xyz = xyz[sub_indices]
+            visible = visible[sub_indices]
             indices.append(sub_indices)
 
-        kdt = KDTree(xyz)
-        indices.append(kdt.knn(xyz, k.pop(), False)[0])
+        # kdt = KDTree(xyz)
+        # indices.append(kdt.knn(xyz, k.pop(), False)[0])
+        kdt = KDTree(xyz.numpy(), visible.numpy())
+        _, idx = kdt.query(xyz.numpy(), visible.numpy(), k=k, alpha=self.alpha, scaler=scaler)
+        indices.append(torch.from_numpy(idx).long())
 
         if not last:
-            self.knn(xyz, grid_size, k, indices, full_xyz)
+            self.knn(xyz, visible, grid_size, k, indices, scaler, full_xyz, full_visible)
 
         if not first:
-            indices.append(kdt.knn(full_xyz, 1, False)[0].squeeze(-1))
+            _, back = kdt.query(full_xyz.numpy(), full_visible.numpy(), k=1, alpha=self.alpha, scaler=scaler)
+            indices.append(torch.from_numpy(back).long())
 
         return
 
